@@ -35,9 +35,8 @@
 #include "wake_up_prompt_tone.h"
 #include "speech_commands_action.h"
 #include "led_strip.h"
+#include "ws2812_control.h"
 
-extern int detect_flag;
-led_strip_handle_t strip = NULL;
 
 typedef struct {
     char* name;
@@ -50,68 +49,6 @@ typedef struct {
 
 // LED_BUILTIN equivalent for ESP32-S3-N16R8 (try both GPIO38 and GPIO48)
 #define LED_GPIO 2  // GPIO for external HW-826 LED
-
-void led_Task(void *arg)
-{
-#if defined CONFIG_ESP32_S3_KORVO_1_V4_0_BOARD
-    // ESP32-S3 Korvo board with WS2812 LED strip
-    const led_strip_config_t led_config = {
-        .strip_gpio_num = 19,
-        .max_leds = 12,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-        .led_model = LED_MODEL_WS2812,
-    };
-    const led_strip_rmt_config_t rmt_config = {}; // default
-    led_strip_new_rmt_device(&led_config, &rmt_config, &strip);
-    if (!strip) {
-        printf("install WS2812 driver failed\n");
-        vTaskDelete(NULL);
-        return;
-    }
-    // Clear LED strip (turn off all LEDs)
-    ESP_ERROR_CHECK(led_strip_clear(strip));
-    
-    while (1) {
-        if (detect_flag) {
-            // Light up all LEDs when speech command detected
-            for (int j = 0; j < 12; j++) {
-                ESP_ERROR_CHECK(led_strip_set_pixel(strip, j, 255, 0, 0)); // Red color
-            }
-            ESP_ERROR_CHECK(led_strip_refresh(strip));
-        } else {
-            // Turn off all LEDs
-            ESP_ERROR_CHECK(led_strip_clear(strip));
-            ESP_ERROR_CHECK(led_strip_refresh(strip));
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-#else
-    // ESP32-S3-N16R8 and other generic ESP32-S3 boards with single LED
-    // Configure both GPIO38 and GPIO48 as outputs (ESP32-S3-N16R8 LED_BUILTIN equivalent)
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << LED_GPIO),
-        .pull_down_en = 0,
-        .pull_up_en = 0,
-    };
-    gpio_config(&io_conf);
-    
-    printf("[LED] Configured GPIO%d as LED output for external HW-826\n", LED_GPIO);
-    
-    while (1) {
-        if (detect_flag) {
-            // Turn on LED
-            gpio_set_level(LED_GPIO, 1);
-            printf("[LED] External LED turned ON (GPIO%d)\n", LED_GPIO);
-        } else {
-            // Turn off LED
-            gpio_set_level(LED_GPIO, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-#endif
-}
 
 dac_audio_item_t playlist[] = {
     // {"ie_kaiji.h", ie_kaiji, sizeof(ie_kaiji)},
@@ -135,35 +72,50 @@ dac_audio_item_t playlist[] = {
     {"m_17.h", (uint16_t*)m_17, sizeof(m_17)},
 };
 
+// New task to restore LED color after a delay
+void restore_led_color_task(void *pvParameters) {
+    led_strip_handle_t strip = (led_strip_handle_t)pvParameters;
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Wait for 2 seconds
+    set_led_color(strip, 0xFF0000); // Restore to green (GRB format)
+    vTaskDelete(NULL); // Delete the task after execution
+}
+
 void wake_up_action(void)
 {
     esp_audio_play((int16_t *)(playlist[0].data), playlist[0].length, portMAX_DELAY);
 }
 
-void speech_commands_action(int command_id)
+void speech_commands_action(int command_id, led_strip_handle_t strip)
 {
     printf("[DEBUG] Speech command detected, command_id: %d\n", command_id);
     
     // Set detect_flag to trigger LED lighting when any speech command is recognized
-    detect_flag = 1;
-    printf("[DEBUG] LED detect_flag set to 1 - LED should turn ON now\n");
+    // int detect_flag = 1; // Moved to local if needed, but not used for direct LED control here
+    printf("[DEBUG] Speech command detected, command_id: %d\n", command_id);
     
     // Handle specific commands
     switch (command_id) {
         case 0:
             printf("[ACTION] Command: bang wo guan deng (Turn off light)\n");
+            set_led_color(strip, 0x000000); // Turn off LED
             break;
         case 1:
             printf("[ACTION] Command: bang wo kai deng (Turn on light)\n");
+            set_led_color(strip, 0xFF0000); // Green (GRB format)
             break;
         case 2:
             printf("[ACTION] Command: da kai dian deng (Open electric light)\n");
+            set_led_color(strip, 0xFF0000); // Green (GRB format)
             break;
         case 3:
             printf("[ACTION] Command: kai xiang (Custom command - Open box/Start)\n");
+            set_led_color(strip, 0x0000FF); // Red (GRB format)
+            // Create a task to restore LED color after 2 seconds
+            xTaskCreate(restore_led_color_task, "restore_led_color_task", 2048, (void *)strip, 5, NULL);
             break;
         case 4:
             printf("[ACTION] Command: guan bi dian deng (Close electric light)\n");
+            set_led_color(strip, 0x000000); // Turn off LED
             break;
         default:
             printf("[ACTION] Unknown command_id: %d\n", command_id);
@@ -180,11 +132,7 @@ void speech_commands_action(int command_id)
         esp_audio_play((int16_t *)(playlist[1].data), playlist[1].length, portMAX_DELAY);
     }
     
-    // Keep LED on for 3 seconds after command recognition
-    printf("[DEBUG] Keeping LED on for 3 seconds...\n");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    detect_flag = 0;
-    printf("[DEBUG] LED detect_flag set to 0 - LED should turn OFF now\n");
-    printf("[INFO] ESP32-S3-N16R8 LED control: GPIO%d=%s\n", 
-           LED_GPIO, gpio_get_level(LED_GPIO) ? "HIGH" : "LOW");
+    // Removed delay and detect_flag reset to allow immediate color changes
+    // printf("[INFO] ESP32-S3-N16R8 LED control: GPIO%d=%s\n", 
+    //        LED_GPIO, gpio_get_level(LED_GPIO) ? "HIGH" : "LOW");
 }

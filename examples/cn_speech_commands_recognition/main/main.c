@@ -20,16 +20,31 @@
 #include "esp_board_init.h"
 #include "speech_commands_action.h"
 #include "model_path.h"
+#include "ws2812_control.h"
+#include <inttypes.h>
 
-// External function declarations
-extern void led_Task(void *arg);
+static const char *TAG = "main";
 
 int wakeup_flag = 0;
-int detect_flag = 0;  // Add detect_flag declaration
+// int detect_flag = 0;  // Add detect_flag declaration
 static esp_afe_sr_iface_t *afe_handle = NULL;
-static esp_afe_sr_data_t *afe_data = NULL;
 static volatile int task_flag = 0;
 srmodel_list_t *models = NULL;
+
+// LED状态定义
+typedef enum {
+    LED_STATE_WAITING_WAKEUP,  // 等待唤醒词 - 白色
+    LED_STATE_WAITING_COMMAND, // 等待指令 - 绿色
+    LED_STATE_PROCESSING       // 处理指令 - 根据指令变色
+} led_state_t;
+
+static led_state_t current_led_state = LED_STATE_WAITING_WAKEUP;
+static led_strip_handle_t global_strip = NULL;
+
+typedef struct {
+    esp_afe_sr_data_t *afe_data;
+    led_strip_handle_t strip;
+} detect_task_args_t;
 
 
 void feed_Task(void *arg)
@@ -57,9 +72,61 @@ void feed_Task(void *arg)
     vTaskDelete(NULL);
 }
 
+// 串口监视器任务，用于通过串口控制LED颜色
+void serial_monitor_task(void *pvParameters) {
+    char input_buffer[32];
+    int buffer_index = 0;
+    
+    ESP_LOGI(TAG, "串口监视器已启动，输入格式: led RRGGBB (例如: led FF0000)");
+    
+    while (1) {
+        int c = getchar();
+        if (c != EOF) {
+            if (c == '\n' || c == '\r') {
+                if (buffer_index > 0) {
+                    input_buffer[buffer_index] = '\0';
+                    
+                    // 解析LED命令
+                    if (strncmp(input_buffer, "led ", 4) == 0 && strlen(input_buffer) == 10) {
+                        char *color_str = input_buffer + 4;
+                        uint32_t color = 0;
+                        
+                        // 解析十六进制颜色值 (RGB格式)
+                        if (sscanf(color_str, "%06" PRIX32, &color) == 1) {
+                            // 转换RGB到GRB格式
+                            uint8_t r = (color >> 16) & 0xFF;
+                            uint8_t g = (color >> 8) & 0xFF;
+                            uint8_t b = color & 0xFF;
+                            uint32_t grb_color = (g << 16) | (r << 8) | b;
+                            
+                            if (global_strip != NULL) {
+                                set_led_color(global_strip, grb_color);
+                                ESP_LOGI(TAG, "LED颜色已设置为: R=%02X G=%02X B=%02X (GRB=0x%06" PRIX32 ")", r, g, b, grb_color);
+                             } else {
+                                 ESP_LOGE(TAG, "LED strip未初始化");
+                             }
+                         } else {
+                             ESP_LOGE(TAG, "无效的颜色格式，请使用: led RRGGBB");
+                         }
+                     } else {
+                         ESP_LOGI(TAG, "可用命令: led RRGGBB (例如: led FF0000 设置红色)");
+                     }
+                    
+                    buffer_index = 0;
+                }
+            } else if (buffer_index < sizeof(input_buffer) - 1) {
+                input_buffer[buffer_index++] = c;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void detect_Task(void *arg)
 {
-    esp_afe_sr_data_t *afe_data = arg;
+    detect_task_args_t *task_args = (detect_task_args_t *)arg;
+    esp_afe_sr_data_t *afe_data = task_args->afe_data;
+    led_strip_handle_t strip = task_args->strip;
     int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data);
     char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
     printf("multinet:%s\n", mn_name);
@@ -104,10 +171,24 @@ void detect_Task(void *arg)
 
         if (res->raw_data_channels == 1 && res->wakeup_state == WAKENET_DETECTED) {
             wakeup_flag = 1;
+            // detect_flag = 0; // Reset detect_flag on wake word
+            printf("Wakeup flag set to 1 (WAKENET_DETECTED)\n");
+            
+            // 检测到唤醒词，切换到等待指令状态，显示绿色
+            current_led_state = LED_STATE_WAITING_COMMAND;
+            set_led_color(strip, 0xFF0000);  // 绿色 (GRB格式)
+            printf("LED显示绿色，等待语音指令\n");
         } else if (res->raw_data_channels > 1 && res->wakeup_state == WAKENET_CHANNEL_VERIFIED) {
             // For a multi-channel AFE, it is necessary to wait for the channel to be verified.
             printf("AFE_FETCH_CHANNEL_VERIFIED, channel index: %d\n", res->trigger_channel_id);
             wakeup_flag = 1;
+            // detect_flag = 0; // Reset detect_flag on wake word
+            printf("Wakeup flag set to 1 (WAKENET_CHANNEL_VERIFIED)\n");
+            
+            // 检测到唤醒词，切换到等待指令状态，显示绿色
+            current_led_state = LED_STATE_WAITING_COMMAND;
+            set_led_color(strip, 0xFF0000);  // 绿色 (GRB格式)
+            printf("LED显示绿色，等待语音指令\n");
         }
 
         if (wakeup_flag == 1) {
@@ -123,8 +204,17 @@ void detect_Task(void *arg)
                     printf("TOP %d, command_id: %d, phrase_id: %d, string:%s prob: %f\n", 
                     i+1, mn_result->command_id[i], mn_result->phrase_id[i], mn_result->string, mn_result->prob[i]);
                 }
-                // Call speech command action to trigger LED and audio
-                speech_commands_action(mn_result->command_id[0]);
+                // 处理语音指令
+                current_led_state = LED_STATE_PROCESSING;
+                speech_commands_action(mn_result->command_id[0], strip);
+                
+                // 指令处理完成，返回等待唤醒词状态
+                vTaskDelay(pdMS_TO_TICKS(2000));  // 保持指令颜色2秒
+                current_led_state = LED_STATE_WAITING_WAKEUP;
+                set_led_color(strip, 0xFFFFFF);  // 返回白色
+                printf("指令处理完成，LED返回白色，等待唤醒词\n");
+                wakeup_flag = 0;
+
                 printf("\n-----------listening-----------\n");
             }
 
@@ -133,6 +223,11 @@ void detect_Task(void *arg)
                 printf("timeout, string:%s\n", mn_result->string);
                 afe_handle->enable_wakenet(afe_data);
                 wakeup_flag = 0;
+                // detect_flag = 0; // Reset detect_flag on timeout
+                
+                // 超时，返回等待唤醒词状态
+                current_led_state = LED_STATE_WAITING_WAKEUP;
+                set_led_color(strip, 0xFFFFFF);  // 返回白色
                 printf("\n-----------awaits to be waken up-----------\n");
                 continue;
             }
@@ -157,9 +252,24 @@ void app_main()
     afe_config_free(afe_config);
 
     task_flag = 1;
-    xTaskCreatePinnedToCore(&detect_Task, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);
-    xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
+    led_strip_handle_t strip = init_ws2812(GPIO_NUM_48);
+    global_strip = strip;  // 保存全局引用
     
-    // Start LED task for visual feedback
-    xTaskCreatePinnedToCore(&led_Task, "led", 4 * 1024, NULL, 3, NULL, 0);
+    // 初始状态：等待唤醒词，显示白色
+    current_led_state = LED_STATE_WAITING_WAKEUP;
+    set_led_color(strip, 0xFFFFFF); // 初始状态：白色，等待唤醒词 (GRB格式)
+    ESP_LOGI(TAG, "Ready - LED显示白色，等待唤醒词");
+
+    detect_task_args_t *task_args = (detect_task_args_t *)malloc(sizeof(detect_task_args_t));
+    task_args->afe_data = afe_data;
+    task_args->strip = strip;
+
+    xTaskCreatePinnedToCore(&detect_Task, "detect", 8 * 1024, (void*)task_args, 5, NULL, 1);
+    xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
+    xTaskCreatePinnedToCore(&serial_monitor_task, "serial_monitor", 4 * 1024, NULL, 3, NULL, 0);
+    
+    // Keep main task alive
+    while(1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }

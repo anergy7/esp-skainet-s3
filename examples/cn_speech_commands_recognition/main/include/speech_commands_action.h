@@ -10,7 +10,9 @@
 
 void led_Task(void *arg);
 
-void speech_commands_action(int command_id);
+#include "led_strip.h"
+
+void speech_commands_action(int command_id, led_strip_handle_t strip);
 
 void wake_up_action(void);
 #endif
