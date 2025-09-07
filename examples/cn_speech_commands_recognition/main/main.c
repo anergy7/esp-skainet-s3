@@ -16,11 +16,16 @@
 #include "esp_afe_sr_models.h"
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
+#include "esp_mn_speech_commands.h"
 #include "esp_board_init.h"
 #include "speech_commands_action.h"
 #include "model_path.h"
 
+// External function declarations
+extern void led_Task(void *arg);
+
 int wakeup_flag = 0;
+int detect_flag = 0;  // Add detect_flag declaration
 static esp_afe_sr_iface_t *afe_handle = NULL;
 static esp_afe_sr_data_t *afe_data = NULL;
 static volatile int task_flag = 0;
@@ -41,6 +46,9 @@ void feed_Task(void *arg)
         esp_get_feed_data(true, i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
 
         afe_handle->feed(afe_data, i2s_buff);
+        
+        // Add small delay to prevent AFE ringbuffer overflow
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (i2s_buff) {
         free(i2s_buff);
@@ -57,7 +65,25 @@ void detect_Task(void *arg)
     printf("multinet:%s\n", mn_name);
     esp_mn_iface_t *multinet = esp_mn_handle_from_name(mn_name);
     model_iface_data_t *model_data = multinet->create(mn_name, 6000);
-    esp_mn_commands_update_from_sdkconfig(multinet, model_data); // Add speech commands from sdkconfig
+    printf("Before esp_mn_commands_update_from_sdkconfig\n");
+    esp_mn_error_t *update_error = esp_mn_commands_update_from_sdkconfig(multinet, model_data); // Add speech commands from sdkconfig
+    if (update_error == NULL) {
+        printf("esp_mn_commands_update_from_sdkconfig returned NULL - MULTINET7_QUANT does not support sdkconfig commands\n");
+        printf("Manually adding custom commands...\n");
+        
+        // Manually add custom commands since MULTINET7_QUANT doesn't support sdkconfig loading
+        esp_mn_commands_alloc(multinet, model_data);
+        esp_mn_commands_add(0, "bang wo guan deng");
+        esp_mn_commands_add(1, "bang wo kai deng");
+        esp_mn_commands_add(2, "da kai dian deng");
+        esp_mn_commands_add(3, "kai xiang");  // Add the custom command
+        esp_mn_commands_add(4, "guan bi dian deng");
+        
+        printf("Custom commands added manually\n");
+        esp_mn_commands_update();
+    } else {
+        printf("esp_mn_commands_update_from_sdkconfig completed with errors\n");
+    }
     int mu_chunksize = multinet->get_samp_chunksize(model_data);
     assert(mu_chunksize == afe_chunksize);
 
@@ -97,6 +123,8 @@ void detect_Task(void *arg)
                     printf("TOP %d, command_id: %d, phrase_id: %d, string:%s prob: %f\n", 
                     i+1, mn_result->command_id[i], mn_result->phrase_id[i], mn_result->string, mn_result->prob[i]);
                 }
+                // Call speech command action to trigger LED and audio
+                speech_commands_action(mn_result->command_id[0]);
                 printf("\n-----------listening-----------\n");
             }
 
@@ -131,4 +159,7 @@ void app_main()
     task_flag = 1;
     xTaskCreatePinnedToCore(&detect_Task, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
+    
+    // Start LED task for visual feedback
+    xTaskCreatePinnedToCore(&led_Task, "led", 4 * 1024, NULL, 3, NULL, 0);
 }
