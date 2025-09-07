@@ -5,8 +5,10 @@ set(srcs
 
 set(requires
     hardware_driver
+    bt
     )
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS include
-                       REQUIRES ${requires} ws2812_control)
+                       REQUIRES ${requires}
+                       PRIV_REQUIRES ws2812_control nvs_flash)
